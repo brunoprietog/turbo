@@ -139,12 +139,11 @@ export class Session {
 
   // History delegate
 
-  historyPoppedToLocationWithRestorationIdentifierAndDirection(location, restorationIdentifier, direction) {
+  historyPoppedToLocationWithRestorationIdentifier(location, restorationIdentifier) {
     if (this.enabled) {
       this.navigator.startVisit(location, restorationIdentifier, {
         action: "restore",
-        historyChanged: true,
-        direction
+        historyChanged: true
       })
     } else {
       this.adapter.pageInvalidated({
@@ -200,7 +199,6 @@ export class Session {
   visitStarted(visit) {
     if (!visit.acceptsStreamResponse) {
       markAsBusy(document.documentElement)
-      this.view.markVisitDirection(visit.direction)
     }
     extendURLWithDeprecatedProperties(visit.location)
     if (!visit.silent) {
@@ -209,7 +207,6 @@ export class Session {
   }
 
   visitCompleted(visit) {
-    this.view.unmarkVisitDirection()
     clearBusyState(document.documentElement)
     this.notifyApplicationAfterPageLoad(visit.getTimingMetrics())
   }

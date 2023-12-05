@@ -6,7 +6,6 @@ export class History {
   restorationData = {}
   started = false
   pageLoaded = false
-  currentIndex = 0
 
   constructor(delegate) {
     this.delegate = delegate
@@ -16,7 +15,6 @@ export class History {
     if (!this.started) {
       addEventListener("popstate", this.onPopState, false)
       addEventListener("load", this.onPageLoad, false)
-      this.currentIndex = history.state?.turbo?.restorationIndex || 0
       this.started = true
       this.replace(new URL(window.location.href))
     }
@@ -39,9 +37,7 @@ export class History {
   }
 
   update(method, location, restorationIdentifier = uuid()) {
-    if (method === history.pushState) ++this.currentIndex
-
-    const state = { turbo: { restorationIdentifier, restorationIndex: this.currentIndex } }
+    const state = { turbo: { restorationIdentifier } }
     method.call(history, state, "", location.href)
     this.location = location
     this.restorationIdentifier = restorationIdentifier
@@ -85,11 +81,9 @@ export class History {
       const { turbo } = event.state || {}
       if (turbo) {
         this.location = new URL(window.location.href)
-        const { restorationIdentifier, restorationIndex } = turbo
+        const { restorationIdentifier } = turbo
         this.restorationIdentifier = restorationIdentifier
-        const direction = restorationIndex > this.currentIndex ? "forward" : "back"
-        this.delegate.historyPoppedToLocationWithRestorationIdentifierAndDirection(this.location, restorationIdentifier, direction)
-        this.currentIndex = restorationIndex
+        this.delegate.historyPoppedToLocationWithRestorationIdentifier(this.location, restorationIdentifier)
       }
     }
   }

@@ -99,14 +99,6 @@ export class View {
     }
   }
 
-  markVisitDirection(direction) {
-    this.element.setAttribute("data-turbo-visit-direction", direction)
-  }
-
-  unmarkVisitDirection() {
-    this.element.removeAttribute("data-turbo-visit-direction")
-  }
-
   async renderSnapshot(renderer) {
     await renderer.render()
   }
