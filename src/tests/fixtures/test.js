@@ -73,6 +73,7 @@
   "turbo:before-visit",
   "turbo:load",
   "turbo:render",
+  "turbo:before-prefetch",
   "turbo:before-fetch-request",
   "turbo:submit-start",
   "turbo:submit-end",
@@ -83,8 +84,17 @@
   "turbo:frame-load",
   "turbo:frame-render",
   "turbo:frame-missing",
+  "turbo:before-frame-morph",
+  "turbo:morph",
+  "turbo:before-morph-element",
+  "turbo:morph-element",
+  "turbo:before-morph-attribute",
   "turbo:reload"
 ])
+
+window.visitLogs = []
+
+addEventListener("turbo:visit", ({ detail }) => window.visitLogs.push(detail))
 
 customElements.define(
   "custom-link-element",

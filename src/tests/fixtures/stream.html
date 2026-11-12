@@ -26,14 +26,12 @@
       <button>Receive Message</button>
     </form>
 
-    <form id="form_with_action_names">
-      <input name="after" type="hidden">
-      <input name="append" type="hidden">
-      <input name="before" type="hidden">
-      <input name="prepend" type="hidden">
-      <input name="remove" type="hidden">
-      <input name="replace" type="hidden">
-      <input name="update" type="hidden">
+    <form id="form-with-stream-methods" method="post" action="/__turbo/messages">
+      <input type="hidden" name="content" value="Hello form!">
+      <input type="hidden" name="type" value="stream">
+      <input type="hidden" name="target" value="form-with-stream-methods">
+      <input type="hidden" name="append">
+      <button>Append to form</button>
     </form>
 
     <div id="messages">
@@ -48,6 +46,10 @@
 
     <div id="container">
       <input id="container-element">
+    </div>
+
+    <div id="message_1">
+      <div>Morph me</div>
     </div>
   </body>
 </html>
