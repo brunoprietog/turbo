@@ -1,31 +1,6 @@
 import { expect, test } from "@playwright/test"
 import { clickWithoutScrolling } from "../helpers/page"
 
-async function startScrolledVisit(page, status, scroll = "reset") {
-  await page.goto(`/__turbo/error_scroll/${status}/${scroll}`)
-  await page.evaluate(() => {
-    window.scrollTo(120, 600)
-    window.errorVisitCompleted = false
-    addEventListener("turbo:load", () => window.errorVisitCompleted = true, { once: true })
-  })
-  expect(await scrollPosition(page)).toEqual({ x: 120, y: 600 })
-}
-
-async function errorResponseRendered(page, status, navigate) {
-  const response = page.waitForResponse((response) =>
-    response.request().resourceType() === "fetch" && new URL(response.url()).pathname.includes("/error_scroll/")
-  )
-  await navigate()
-  expect((await response).status()).toEqual(status)
-  await page.waitForFunction(() => window.errorVisitCompleted)
-  await expect(page.locator("h1")).toHaveText("Error response")
-  expect(await page.locator("body").evaluate((body) => body.scrollHeight)).toBeGreaterThan(3000)
-}
-
-function scrollPosition(page) {
-  return page.evaluate(() => ({ x: window.scrollX, y: window.scrollY }))
-}
-
 for (const status of [404, 500]) {
   test(`a link to an HTTP ${status} response scrolls to the top`, async ({ page }) => {
     await startScrolledVisit(page, status)
@@ -52,4 +27,29 @@ for (const scroll of ["reset", "preserve"]) {
     expect(page.url()).toEqual(originalURL)
     expect(await scrollPosition(page)).toEqual(scroll === "preserve" ? { x: 120, y: 600 } : { x: 0, y: 0 })
   })
+}
+
+async function startScrolledVisit(page, status, scroll = "reset") {
+  await page.goto(`/__turbo/error_scroll/${status}/${scroll}`)
+  await page.evaluate(() => {
+    window.scrollTo(120, 600)
+    window.errorVisitCompleted = false
+    addEventListener("turbo:load", () => window.errorVisitCompleted = true, { once: true })
+  })
+  expect(await scrollPosition(page)).toEqual({ x: 120, y: 600 })
+}
+
+async function errorResponseRendered(page, status, navigate) {
+  const response = page.waitForResponse((response) =>
+    response.request().resourceType() === "fetch" && new URL(response.url()).pathname.includes("/error_scroll/")
+  )
+  await navigate()
+  expect((await response).status()).toEqual(status)
+  await page.waitForFunction(() => window.errorVisitCompleted)
+  await expect(page.locator("h1")).toHaveText("Error response")
+  expect(await page.locator("body").evaluate((body) => body.scrollHeight)).toBeGreaterThan(3000)
+}
+
+function scrollPosition(page) {
+  return page.evaluate(() => ({ x: window.scrollX, y: window.scrollY }))
 }
