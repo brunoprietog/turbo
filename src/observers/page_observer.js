@@ -19,19 +19,16 @@ export class PageObserver {
         this.stage = PageStage.loading
       }
       document.addEventListener("readystatechange", this.interpretReadyState, false)
+      document.addEventListener("DOMContentLoaded", this.interpretReadyState, false)
       addEventListener("pagehide", this.pageWillUnload, false)
       this.started = true
-      if (document.readyState === "interactive") {
-        document.addEventListener("DOMContentLoaded", () => {
-          this.interpretReadyState()
-        }, { once: true })
-      }
     }
   }
 
   stop() {
     if (this.started) {
       document.removeEventListener("readystatechange", this.interpretReadyState, false)
+      document.removeEventListener("DOMContentLoaded", this.interpretReadyState, false)
       removeEventListener("pagehide", this.pageWillUnload, false)
       this.started = false
     }
