@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <title>Left</title>
-    <meta name="view-transition" content="same-origin" />
+    <meta name="turbo-view-transition" content="true" />
     <script src="/dist/turbo.es2017-umd.js" data-turbo-track="reload"></script>
 
     <style>
@@ -27,5 +27,8 @@
     <p><a id="go-right" href="/src/tests/fixtures/transitions/right.html">go right</a></p>
     <div class="square"></div>
     <p><a id="go-other" href="/src/tests/fixtures/transitions/other.html">go other</a></p>
+    <turbo-frame id="frame">
+      <a id="go-frame" href="/src/tests/fixtures/transitions/frame.html" data-turbo-action="advance">go frame</a>
+    </turbo-frame>
   </body>
 </html>
