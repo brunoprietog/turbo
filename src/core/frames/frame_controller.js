@@ -10,11 +10,12 @@ import {
   markAsBusy,
   uuid,
   getHistoryMethodForAction,
-  getVisitAction
+  getVisitAction,
+  removeTemporaryElementsFrom
 } from "../../util"
-import { FormSubmission } from "../drive/form_submission"
+import { FormSubmission, FormSubmissionState } from "../drive/form_submission"
 import { Snapshot } from "../snapshot"
-import { getAction, expandURL, urlsAreEqual, locationIsVisitable } from "../url"
+import { getAction, expandURL, getRequestURL, locationIsVisitable } from "../url"
 import { FormSubmitObserver } from "../../observers/form_submit_observer"
 import { FrameView } from "./frame_view"
 import { LinkInterceptor } from "./link_interceptor"
@@ -25,20 +26,18 @@ import { session } from "../index"
 import { StreamMessage } from "../streams/stream_message"
 import { PageSnapshot } from "../drive/page_snapshot"
 import { TurboFrameMissingError } from "../errors"
+import { VisitState } from "../drive/visit"
 
 export class FrameController {
-  fetchResponseLoaded = (_fetchResponse) => Promise.resolve()
   #currentFetchRequest = null
-  #resolveVisitPromise = () => {}
+  #fetchRequests = new WeakMap()
+  #proposedVisit = null
+  #pendingMorphRefresh = false
   #connected = false
   #hasBeenLoaded = false
   #ignoredAttributes = new Set()
-  #shouldMorphFrame = false
-  #morphingRequests = new WeakSet()
-  #currentRequestIsMorphRefresh = false
-  #pendingMorphRefresh = false
-  #performingMorphRefresh = false
-  action = null
+  #formSubmissions = new Set()
+  #formSubmissionContexts = new WeakMap()
 
   constructor(element) {
     this.element = element
@@ -69,15 +68,20 @@ export class FrameController {
   disconnect() {
     if (this.#connected) {
       this.#connected = false
+      this.#pendingMorphRefresh = false
       this.appearanceObserver.stop()
       this.formLinkClickObserver.stop()
       this.linkInterceptor.stop()
       this.formSubmitObserver.stop()
 
-      this.#pendingMorphRefresh = false
-
       if (!this.element.hasAttribute("recurse")) {
         this.#cancelFetchRequest()
+
+        if (!this.element.isConnected) {
+          for (const formSubmission of this.#formSubmissions) {
+            if (formSubmission.isSafe) formSubmission.stop()
+          }
+        }
       }
     }
   }
@@ -94,8 +98,6 @@ export class FrameController {
   sourceURLChanged() {
     if (this.#isIgnoringChangesTo("src")) return
 
-    // An explicit src change (external navigation, or an explicit reload()'s
-    // null-then-set toggle) supersedes any queued morph refresh.
     this.#pendingMorphRefresh = false
 
     if (!this.sourceURL) {
@@ -112,42 +114,18 @@ export class FrameController {
   }
 
   sourceURLReloaded() {
-    const { refresh, src } = this.element
-
-    this.#shouldMorphFrame = src && refresh === "morph"
-
-    this.element.removeAttribute("complete")
-    this.element.src = null
-    this.element.src = src
-    return this.element.loaded
+    return this.#reload()
   }
 
-  // Refresh the frame's contents as part of a page or ancestor-frame morph.
-  //
-  // Unlike reload(), this does not unconditionally abort and re-issue the
-  // frame's fetch. If a morph-driven refresh is already in flight, the new
-  // morph is coalesced into a single queued follow-up that runs once the
-  // in-flight request settles. Without this, a burst of morphs (e.g. repeated
-  // refresh broadcasts) would each abort the request the previous morph
-  // started, starving the fetch so its content never lands.
   refreshForMorph() {
-    if (this.#currentRequestIsMorphRefresh) {
-      this.#pendingMorphRefresh = true
-    } else {
-      this.#performMorphRefresh()
-    }
-  }
+    if (this.element.shouldReloadWithMorph) {
+      const context = this.#fetchRequests.get(this.#currentFetchRequest)
 
-  // Reuse reload()'s exact refresh semantics (complete/src handling, lazy and
-  // disabled gating, morph-render selection), tagging the resulting request as
-  // a morph refresh so the scheduler can coalesce subsequent morphs against it.
-  #performMorphRefresh() {
-    this.#pendingMorphRefresh = false
-    this.#performingMorphRefresh = true
-    try {
-      this.sourceURLReloaded()
-    } finally {
-      this.#performingMorphRefresh = false
+      if (context?.isMorphRefresh) {
+        this.#pendingMorphRefresh = true
+      } else {
+        this.#reload({ isMorphRefresh: true })
+      }
     }
   }
 
@@ -160,40 +138,59 @@ export class FrameController {
     }
   }
 
-  async #loadSourceURL() {
+  async #loadSourceURL(options = {}) {
     if (this.enabled && this.isActive && !this.complete && this.sourceURL) {
-      this.element.loaded = this.#visit(expandURL(this.sourceURL))
+      this.element.loaded = this.#visit(expandURL(this.sourceURL), options)
       this.appearanceObserver.stop()
       await this.element.loaded
-      this.#hasBeenLoaded = true
     }
   }
 
-  async loadResponse(fetchResponse, { morph = false } = {}) {
+  async loadResponse(fetchResponse, requestURL, { proposedVisit = null, shouldMorphFrame = false } = {}) {
     if (fetchResponse.redirected || (fetchResponse.succeeded && fetchResponse.isHTML)) {
-      this.sourceURL = fetchResponse.response.url
+      const responseURL = expandURL(fetchResponse.response.url)
+      if (!fetchResponse.redirected && !responseURL.hash && requestURL) {
+        responseURL.hash = requestURL.hash
+      }
+      this.sourceURL = responseURL.href
     }
+    if (proposedVisit) proposedVisit.location = expandURL(this.sourceURL || requestURL)
 
     try {
-      const html = await fetchResponse.responseHTML
-      if (html) {
-        const document = parseHTMLDocument(html)
+      const responseHTML = await fetchResponse.responseHTML
+      if (responseHTML) {
+        if (proposedVisit) {
+          proposedVisit.response = {
+            statusCode: fetchResponse.statusCode,
+            redirected: fetchResponse.redirected,
+            responseHTML
+          }
+        }
+        const document = parseHTMLDocument(responseHTML)
         const pageSnapshot = PageSnapshot.fromDocument(document)
 
         if (pageSnapshot.isVisitable) {
-          await this.#loadFrameResponse(fetchResponse, document, morph)
+          await this.#loadFrameResponse(fetchResponse, document, proposedVisit, shouldMorphFrame)
         } else {
           await this.#handleUnvisitableFrameResponse(fetchResponse)
         }
       }
     } finally {
-      this.fetchResponseLoaded = () => Promise.resolve()
+      if (this.#proposedVisit === proposedVisit) this.#proposedVisit = null
     }
   }
 
   // Appearance observer delegate
 
   elementAppearedInViewport(element) {
+    if (!this.isActive) return
+
+    if (this.complete) {
+      this.#hasBeenLoaded = true
+      this.appearanceObserver.stop()
+      return
+    }
+
     this.proposeVisitIfNavigatedWithAction(element, getVisitAction(element))
     this.#loadSourceURL()
   }
@@ -226,17 +223,29 @@ export class FrameController {
   }
 
   formSubmitted(element, submitter) {
-    if (this.formSubmission) {
-      this.formSubmission.stop()
-    }
+    const previousSubmission = this.formSubmission
+    const previousContext = this.#formSubmissionContexts.get(previousSubmission)
+    const previous = previousContext?.proposedVisit ? {
+      formSubmission: previousSubmission,
+      frame: previousContext.frame,
+      proposedVisit: previousContext.proposedVisit
+    } : previousContext?.previous
+    previousSubmission?.stop()
 
     this.formSubmission = new FormSubmission(this, element, submitter)
 
     const { fetchRequest } = this.formSubmission
     const frame = this.#findFrameElement(element, submitter)
 
+    this.#formSubmissionContexts.set(this.formSubmission, {
+      frame,
+      initialBody: frame.ownerDocument.body,
+      initialLocation: session.location.href,
+      previous
+    })
+
     this.prepareRequest(fetchRequest, frame)
-    this.formSubmission.start()
+    this.#startFormSubmission(this.formSubmission, frame)
   }
 
   // Fetch request delegate
@@ -258,18 +267,28 @@ export class FrameController {
   }
 
   async requestSucceededWithResponse(request, response) {
+    let responseError
+
     try {
-      await this.loadResponse(response, { morph: this.#morphingRequests.has(request) })
+      await this.loadResponse(response, request.url, this.#fetchRequests.get(request))
+    } catch (error) {
+      responseError = error
+      throw error
     } finally {
-      this.#finishRequest(request)
+      this.#finishRequest(request, responseError)
     }
   }
 
   async requestFailedWithResponse(request, response) {
+    let responseError
+
     try {
-      await this.loadResponse(response, { morph: this.#morphingRequests.has(request) })
+      await this.loadResponse(response, request.url, this.#fetchRequests.get(request))
+    } catch (error) {
+      responseError = error
+      throw error
     } finally {
-      this.#finishRequest(request)
+      this.#finishRequest(request, responseError)
     }
   }
 
@@ -278,46 +297,52 @@ export class FrameController {
     this.#finishRequest(request)
   }
 
-  requestFinished(_request) {
-    clearBusyState(this.element)
+  requestFinished(request) {
+    if (!this.#currentFetchRequest || this.#currentFetchRequest === request) clearBusyState(this.element)
   }
 
   // Form submission delegate
 
-  formSubmissionStarted({ formElement }) {
-    markAsBusy(formElement, this.#findFrameElement(formElement))
+  formSubmissionWillStart(formSubmission) {
+    const context = this.#formSubmissionContexts.get(formSubmission)
+    if (context) this.#prepareFormSubmissionVisit(formSubmission, context)
+  }
+
+  formSubmissionStarted(formSubmission) {
+    const frame = this.#formSubmissionContexts.get(formSubmission)?.frame
+    markAsBusy(formSubmission.formElement, frame || this.#findFrameElement(formSubmission.formElement))
   }
 
   formSubmissionSucceededWithResponse(formSubmission, response) {
-    const frame = this.#findFrameElement(formSubmission.formElement, formSubmission.submitter)
+    const context = this.#formSubmissionContexts.get(formSubmission)
+    const frame = context?.frame || this.#findFrameElement(formSubmission.formElement, formSubmission.submitter)
+    const proposedVisit = context?.proposedVisit
 
-    frame.delegate.proposeVisitIfNavigatedWithAction(frame, getVisitAction(formSubmission.submitter, formSubmission.formElement, frame))
-    frame.delegate.#loadFormResponse(response)
+    frame.delegate.#pendingMorphRefresh = false
+    frame.delegate.loadResponse(response, formSubmission.fetchRequest.url, { proposedVisit })
 
     if (!formSubmission.isSafe) {
       session.clearCache()
     }
   }
 
-  formSubmissionFailedWithResponse(formSubmission, fetchResponse) {
-    this.element.delegate.#loadFormResponse(fetchResponse)
+  formSubmissionSucceededWithStreamResponse(_formSubmission, _fetchResponse) {
     session.clearCache()
   }
 
-  // A form response navigates whichever frame it renders into — the target on
-  // success, the originating frame on failure — without passing through
-  // sourceURLChanged, so it supersedes that frame's queued morph refresh here.
-  #loadFormResponse(fetchResponse) {
+  formSubmissionFailedWithResponse(formSubmission, fetchResponse) {
     this.#pendingMorphRefresh = false
-    return this.loadResponse(fetchResponse)
+    this.element.delegate.loadResponse(fetchResponse, formSubmission.fetchRequest.url)
+    session.clearCache()
   }
 
   formSubmissionErrored(formSubmission, error) {
     console.error(error)
   }
 
-  formSubmissionFinished({ formElement }) {
-    clearBusyState(formElement, this.#findFrameElement(formElement))
+  formSubmissionFinished(formSubmission) {
+    const frame = this.#formSubmissionContexts.get(formSubmission)?.frame
+    clearBusyState(formSubmission.formElement, frame || this.#findFrameElement(formSubmission.formElement))
   }
 
   // View delegate
@@ -349,106 +374,146 @@ export class FrameController {
 
   viewInvalidated() {}
 
-  // Frame renderer delegate
-
-  willRenderFrame(currentElement, _newElement) {
-    // Only clone the frame for promoted frame visits, where visitCachedSnapshot
-    // consumes the clone to restore the frame's contents into the cached page
-    // snapshot (and deletes it). For plain frame renders — src changes without
-    // a data-turbo-action, refresh="morph" reloads, broadcast-driven reloads —
-    // nothing ever consumes or clears the clone, so it would pin a complete
-    // copy of the frame's previous subtree on the controller indefinitely.
-    if (this.action) {
-      this.previousFrameElement = currentElement.cloneNode(true)
-    }
-  }
-
-  visitCachedSnapshot = ({ element }) => {
-    const frame = element.querySelector("#" + this.element.id)
-
-    if (frame && this.previousFrameElement) {
-      frame.replaceChildren(...this.previousFrameElement.children)
-    }
-
-    delete this.previousFrameElement
-  }
-
   // Private
 
-  async #loadFrameResponse(fetchResponse, document, morph) {
+  #reload({ isMorphRefresh = false } = {}) {
+    const { refresh, src } = this.element
+    const hadActiveRequest = this.#currentFetchRequest !== null
+
+    this.#pendingMorphRefresh = false
+    this.element.removeAttribute("complete")
+    this.sourceURL = null
+    this.#cancelFetchRequest()
+    this.sourceURL = src
+
+    if (this.loadingStyle == FrameLoadingStyle.eager || this.#hasBeenLoaded || (isMorphRefresh && hadActiveRequest)) {
+      this.#loadSourceURL({ shouldMorphFrame: refresh === "morph", isMorphRefresh })
+    }
+
+    return this.element.loaded
+  }
+
+  #cancelFetchRequest() {
+    const request = this.#currentFetchRequest
+    request?.cancel()
+
+    if (this.#currentFetchRequest === request) {
+      this.#currentFetchRequest = null
+    }
+  }
+
+  #finishRequest(request, responseError) {
+    const context = this.#fetchRequests.get(request)
+    const isCurrentRequest = this.#currentFetchRequest === request
+    const aborted = responseError?.name === "AbortError"
+    const shouldRefresh = !aborted && isCurrentRequest && context?.isMorphRefresh && this.#pendingMorphRefresh
+
+    if (isCurrentRequest) {
+      this.#currentFetchRequest = null
+      this.#pendingMorphRefresh = false
+    }
+
+    this.#fetchRequests.delete(request)
+
+    if (context && !aborted) {
+      this.#hasBeenLoaded = true
+      context.resolve()
+    }
+
+    if (shouldRefresh) this.refreshForMorph()
+  }
+
+  #prepareFormSubmissionVisit(formSubmission, context) {
+    const { formElement, submitter } = formSubmission
+    const { frame, initialBody, initialLocation, previous } = context
+
+    if (frame.ownerDocument.body === initialBody && session.location.href === initialLocation) {
+      const action = getVisitAction(submitter, formElement, frame)
+      const proposedVisit = frame.delegate.#createProposedVisit(frame, action)
+
+      // A reentrant submission can start before the replaced one clears its busy state.
+      if (
+        proposedVisit && previous?.proposedVisit &&
+        previous.formSubmission.state !== FormSubmissionState.stopped &&
+        previous.frame === frame &&
+        previous.proposedVisit.liveSnapshot.element === initialBody &&
+        previous.proposedVisit.originLocation.href === proposedVisit.originLocation.href
+      ) {
+        proposedVisit.snapshot = previous.proposedVisit.snapshot.clone()
+      }
+
+      context.proposedVisit = proposedVisit
+    }
+
+    delete context.previous
+  }
+
+  async #startFormSubmission(formSubmission, frame) {
+    const controller = frame.delegate
+    const { abortSignal } = formSubmission.fetchRequest
+    const onAbort = () => {
+      controller.#formSubmissions.delete(formSubmission)
+      // Release snapshots on abort while keeping the target for busy-state cleanup.
+      this.#formSubmissionContexts.set(formSubmission, { frame })
+    }
+
+    controller.#formSubmissions.add(formSubmission)
+    abortSignal.addEventListener("abort", onAbort, { once: true })
+
+    try {
+      await formSubmission.start()
+    } finally {
+      abortSignal.removeEventListener("abort", onAbort)
+      controller.#formSubmissions.delete(formSubmission)
+      this.#formSubmissionContexts.delete(formSubmission)
+    }
+  }
+
+  async #loadFrameResponse(fetchResponse, document, proposedVisit, shouldMorphFrame) {
     const newFrameElement = await this.extractForeignFrameElement(document.body)
-    const rendererClass = morph ? MorphingFrameRenderer : FrameRenderer
+    const rendererClass = shouldMorphFrame ? MorphingFrameRenderer : FrameRenderer
 
     if (newFrameElement) {
       const snapshot = new Snapshot(newFrameElement)
-      const renderer = new rendererClass(this, this.view.snapshot, snapshot, false, false)
+      const delegate = {
+        willRenderFrame: (currentElement) => {
+          if (proposedVisit) proposedVisit.previousFrameElement = currentElement.cloneNode(true)
+        }
+      }
+      const renderer = new rendererClass(delegate, this.view.snapshot, snapshot, false, false)
       if (this.view.renderPromise) await this.view.renderPromise
-      this.changeHistory()
+      this.changeHistory(proposedVisit)
 
       await this.view.render(renderer)
       this.complete = true
+      if (proposedVisit) {
+        this.#prepareSnapshotsForVisit(proposedVisit)
+        await this.#cachePromotedVisitIfNeeded(proposedVisit)
+      }
       session.frameRendered(fetchResponse, this.element)
       session.frameLoaded(this.element)
-      await this.fetchResponseLoaded(fetchResponse)
+      if (proposedVisit) await this.#visitFrameResponse(proposedVisit)
     } else if (this.#willHandleFrameMissingFromResponse(fetchResponse)) {
       this.#handleFrameMissingFromResponse(fetchResponse)
     }
   }
 
-  async #visit(url) {
+  async #visit(url, { shouldMorphFrame = false, isMorphRefresh = false } = {}) {
     const request = new FetchRequest(this, FetchMethod.get, url, new URLSearchParams(), this.element)
 
-    this.#currentFetchRequest?.cancel()
+    this.#cancelFetchRequest()
     this.#currentFetchRequest = request
 
-    // Consume the morph-refresh and morph-render tags exactly once, before
-    // perform() dispatches turbo:before-fetch-request — a listener that
-    // synchronously starts another visit must not inherit this request's
-    // classification. The render mode travels with the request so that a
-    // superseded request rendering late can neither steal nor clear it.
-    this.#currentRequestIsMorphRefresh = this.#performingMorphRefresh
-    this.#performingMorphRefresh = false
-    if (this.#shouldMorphFrame) this.#morphingRequests.add(request)
-    this.#shouldMorphFrame = false
-
     return new Promise((resolve) => {
-      this.#resolveVisitPromise = () => {
-        this.#resolveVisitPromise = () => {}
-        this.#currentFetchRequest = null
-        this.#currentRequestIsMorphRefresh = false
-        resolve()
-      }
+      this.#fetchRequests.set(request, {
+        proposedVisit: this.#proposedVisit,
+        shouldMorphFrame,
+        isMorphRefresh,
+        resolve
+      })
+      this.#proposedVisit = null
       request.perform()
     })
-  }
-
-  // Settle the request that just completed. A stale settlement — from a request
-  // that was already superseded (e.g. an ordinary fetch whose render finished
-  // after a morph started its replacement) — is ignored so it can't resolve or
-  // clear the newer in-flight request's state. When the current morph refresh
-  // settles and a morph arrived while it was in flight, start a single coalesced
-  // follow-up. #performMorphRefresh reuses reload()'s gating, so a disconnected
-  // or disabled frame never issues a deferred fetch.
-  #finishRequest(request) {
-    if (request !== this.#currentFetchRequest) return
-
-    const wasMorphRefresh = this.#currentRequestIsMorphRefresh
-    this.#resolveVisitPromise()
-
-    if (wasMorphRefresh && this.#pendingMorphRefresh) {
-      this.#performMorphRefresh()
-    }
-  }
-
-  // Cancel the in-flight request without installing a replacement. An aborted
-  // request never reaches #finishRequest (perform() swallows the AbortError), so
-  // its identity and morph-refresh marker must be retired here — otherwise the
-  // marker would keep pointing at a dead request and every later morph would
-  // coalesce behind it forever.
-  #cancelFetchRequest() {
-    this.#currentFetchRequest?.cancel()
-    this.#currentFetchRequest = null
-    this.#currentRequestIsMorphRefresh = false
   }
 
   #navigateFrame(element, url, submitter) {
@@ -462,39 +527,118 @@ export class FrameController {
   }
 
   proposeVisitIfNavigatedWithAction(frame, action = null) {
-    this.action = action
+    this.#proposedVisit = this.#createProposedVisit(frame, action)
+    return this.#proposedVisit
+  }
 
-    if (this.action) {
-      const pageSnapshot = PageSnapshot.fromElement(frame).clone()
-      const { visitCachedSnapshot } = frame.delegate
+  changeHistory(proposedVisit) {
+    if (proposedVisit) {
+      const pageVisit = this.#pageVisitInProgress()
+      proposedVisit.shouldCacheSnapshot &&= pageVisit?.shouldCacheSnapshot !== false
 
-      frame.delegate.fetchResponseLoaded = async (fetchResponse) => {
-        if (frame.src) {
-          const { statusCode, redirected } = fetchResponse
-          const responseHTML = await fetchResponse.responseHTML
-          const response = { statusCode, redirected, responseHTML }
-          const options = {
-            response,
-            visitCachedSnapshot,
-            willRender: false,
-            updateHistory: false,
-            restorationIdentifier: this.restorationIdentifier,
-            snapshot: pageSnapshot
-          }
-
-          if (this.action) options.action = this.action
-
-          session.visit(frame.src, options)
-        }
+      if (document.body === proposedVisit.liveSnapshot.element && !pageVisit?.historyChanged) {
+        const method = getHistoryMethodForAction(proposedVisit.action)
+        session.history.update(method, proposedVisit.location, proposedVisit.restorationIdentifier)
+        proposedVisit.historyChanged = true
+        if (pageVisit) session.view.lastRenderedLocation = proposedVisit.location
       }
     }
   }
 
-  changeHistory() {
-    if (this.action) {
-      const method = getHistoryMethodForAction(this.action)
-      session.history.update(method, expandURL(this.element.src || ""), this.restorationIdentifier)
+  #createProposedVisit(frame, action) {
+    if (action && frame.ownerDocument.body.contains(frame)) {
+      const liveSnapshot = PageSnapshot.fromElement(frame)
+      const pageVisit = this.#pageVisitInProgress()
+      return {
+        action,
+        liveSnapshot,
+        snapshot: liveSnapshot.clone(),
+        originLocation: expandURL(pageVisit?.historyChanged ? session.view.lastRenderedLocation : session.location),
+        restorationIdentifier: this.restorationIdentifier,
+        shouldCacheSnapshot: pageVisit?.shouldCacheSnapshot !== false
+      }
     }
+
+    return null
+  }
+
+  #pageVisitInProgress() {
+    const visit = session.navigator.currentVisit
+    if (visit?.state === VisitState.started && visit.willRender) return visit
+  }
+
+  #prepareSnapshotsForVisit(proposedVisit) {
+    const frameSelector = `#${CSS.escape(this.id)}`
+    const cachedFrame = proposedVisit.snapshot.element.querySelector(frameSelector)
+    if (cachedFrame && proposedVisit.previousFrameElement) {
+      cachedFrame.replaceChildren(...proposedVisit.previousFrameElement.children)
+    }
+    delete proposedVisit.previousFrameElement
+
+    proposedVisit.advancedSnapshot = proposedVisit.liveSnapshot.clone()
+    if (!proposedVisit.liveSnapshot.element.contains(this.element)) {
+      // A permanent frame can move to another page while rendering. Clone it
+      // with the same form-state rules as the rest of the cached snapshot.
+      const { documentElement, headSnapshot } = proposedVisit.liveSnapshot
+      const frameSnapshot = new PageSnapshot(documentElement, this.element, headSnapshot).clone()
+      const advancedFrame = proposedVisit.advancedSnapshot.element.querySelector(frameSelector)
+      advancedFrame?.replaceWith(frameSnapshot.element)
+    }
+  }
+
+  #shouldVisitFrameResponse(proposedVisit, pageVisit) {
+    return (
+      !pageVisit &&
+      document.body === proposedVisit.liveSnapshot.element &&
+      session.location.href === proposedVisit.location.href &&
+      this.sourceURL === proposedVisit.location.href
+    )
+  }
+
+  async #cachePromotedVisitIfNeeded(proposedVisit) {
+    const pageVisit = this.#pageVisitInProgress()
+    proposedVisit.shouldCacheSnapshot &&= pageVisit?.shouldCacheSnapshot !== false
+    const ownsPage = document.body === proposedVisit.liveSnapshot.element
+    const ownsHistory = session.location.href === proposedVisit.location.href
+
+    if (ownsPage && ownsHistory) session.view.lastRenderedLocation = proposedVisit.location
+
+    if (proposedVisit.shouldCacheSnapshot) {
+      await this.#cachePromotedSnapshot(proposedVisit.snapshot, proposedVisit.originLocation)
+      const currentPageVisit = this.#pageVisitInProgress()
+      proposedVisit.shouldCacheSnapshot &&= currentPageVisit?.shouldCacheSnapshot !== false
+
+      if (
+        proposedVisit.shouldCacheSnapshot && proposedVisit.historyChanged &&
+        !this.#shouldVisitFrameResponse(proposedVisit, currentPageVisit)
+      ) {
+        await this.#cachePromotedSnapshot(proposedVisit.advancedSnapshot, proposedVisit.location)
+      }
+    }
+  }
+
+  #cachePromotedSnapshot(snapshot, location) {
+    removeTemporaryElementsFrom(snapshot.element)
+    return session.view.cacheSnapshotAtLocation(snapshot, location)
+  }
+
+  async #visitFrameResponse(proposedVisit) {
+    const pageVisit = this.#pageVisitInProgress()
+    if (!this.#shouldVisitFrameResponse(proposedVisit, pageVisit)) {
+      await this.#cachePromotedVisitIfNeeded(proposedVisit)
+      return
+    }
+
+    // The origin snapshot is already cached under its own URL.
+    session.visit(proposedVisit.location, {
+      action: proposedVisit.action,
+      referrer: proposedVisit.originLocation,
+      response: proposedVisit.response,
+      willRender: false,
+      updateHistory: false,
+      restorationIdentifier: proposedVisit.restorationIdentifier,
+      shouldCacheSnapshot: false
+    })
   }
 
   async #handleUnvisitableFrameResponse(fetchResponse) {
@@ -604,7 +748,7 @@ export class FrameController {
       return false
     }
 
-    if (submitter && !session.elementIsNavigatable(submitter)) {
+    if (submitter && !session.submitterIsNavigatable(submitter)) {
       return false
     }
 
@@ -642,7 +786,7 @@ export class FrameController {
   }
 
   get isLoading() {
-    return this.formSubmission !== undefined || this.#resolveVisitPromise() !== undefined
+    return this.formSubmission !== undefined || this.#currentFetchRequest !== null
   }
 
   get complete() {
@@ -698,7 +842,7 @@ export class FrameController {
 function activateElement(element, currentURL) {
   if (element) {
     const src = element.getAttribute("src")
-    if (src != null && currentURL != null && urlsAreEqual(src, currentURL)) {
+    if (src != null && currentURL != null && getRequestURL(expandURL(src)) == getRequestURL(expandURL(currentURL))) {
       throw new Error(`Matching <turbo-frame id="${element.id}"> element has a source URL which references itself`)
     }
     if (element.ownerDocument !== document) {
