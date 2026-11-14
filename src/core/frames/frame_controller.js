@@ -32,7 +32,7 @@ export class FrameController {
   #currentFetchRequest = null
   #fetchRequests = new WeakMap()
   #proposedVisit = null
-  #resolveVisitPromise = () => {}
+  #pendingMorphRefresh = false
   #connected = false
   #hasBeenLoaded = false
   #ignoredAttributes = new Set()
@@ -68,13 +68,14 @@ export class FrameController {
   disconnect() {
     if (this.#connected) {
       this.#connected = false
+      this.#pendingMorphRefresh = false
       this.appearanceObserver.stop()
       this.formLinkClickObserver.stop()
       this.linkInterceptor.stop()
       this.formSubmitObserver.stop()
 
       if (!this.element.hasAttribute("recurse")) {
-        this.#currentFetchRequest?.cancel()
+        this.#cancelFetchRequest()
 
         if (!this.element.isConnected) {
           for (const formSubmission of this.#formSubmissions) {
@@ -87,7 +88,8 @@ export class FrameController {
 
   disabledChanged() {
     if (this.disabled) {
-      this.#currentFetchRequest?.cancel()
+      this.#pendingMorphRefresh = false
+      this.#cancelFetchRequest()
     } else if (this.loadingStyle == FrameLoadingStyle.eager) {
       this.#loadSourceURL()
     }
@@ -96,8 +98,10 @@ export class FrameController {
   sourceURLChanged() {
     if (this.#isIgnoringChangesTo("src")) return
 
+    this.#pendingMorphRefresh = false
+
     if (!this.sourceURL) {
-      this.#currentFetchRequest?.cancel()
+      this.#cancelFetchRequest()
     }
 
     if (this.element.isConnected) {
@@ -110,18 +114,19 @@ export class FrameController {
   }
 
   sourceURLReloaded() {
-    const { refresh, src } = this.element
+    return this.#reload()
+  }
 
-    this.element.removeAttribute("complete")
-    this.sourceURL = null
-    this.#currentFetchRequest?.cancel()
-    this.sourceURL = src
+  refreshForMorph() {
+    if (this.element.shouldReloadWithMorph) {
+      const context = this.#fetchRequests.get(this.#currentFetchRequest)
 
-    if (this.loadingStyle == FrameLoadingStyle.eager || this.#hasBeenLoaded) {
-      this.#loadSourceURL(refresh === "morph")
+      if (context?.isMorphRefresh) {
+        this.#pendingMorphRefresh = true
+      } else {
+        this.#reload({ isMorphRefresh: true })
+      }
     }
-
-    return this.element.loaded
   }
 
   loadingStyleChanged() {
@@ -133,12 +138,11 @@ export class FrameController {
     }
   }
 
-  async #loadSourceURL(shouldMorphFrame = false) {
+  async #loadSourceURL(options = {}) {
     if (this.enabled && this.isActive && !this.complete && this.sourceURL) {
-      this.element.loaded = this.#visit(expandURL(this.sourceURL), shouldMorphFrame)
+      this.element.loaded = this.#visit(expandURL(this.sourceURL), options)
       this.appearanceObserver.stop()
       await this.element.loaded
-      this.#hasBeenLoaded = true
     }
   }
 
@@ -259,22 +263,38 @@ export class FrameController {
   }
 
   requestPreventedHandlingResponse(request, _response) {
-    this.#resolveRequest(request)
+    this.#finishRequest(request)
   }
 
   async requestSucceededWithResponse(request, response) {
-    await this.loadResponse(response, request.url, this.#fetchRequests.get(request))
-    this.#resolveRequest(request)
+    let responseError
+
+    try {
+      await this.loadResponse(response, request.url, this.#fetchRequests.get(request))
+    } catch (error) {
+      responseError = error
+      throw error
+    } finally {
+      this.#finishRequest(request, responseError)
+    }
   }
 
   async requestFailedWithResponse(request, response) {
-    await this.loadResponse(response, request.url, this.#fetchRequests.get(request))
-    this.#resolveRequest(request)
+    let responseError
+
+    try {
+      await this.loadResponse(response, request.url, this.#fetchRequests.get(request))
+    } catch (error) {
+      responseError = error
+      throw error
+    } finally {
+      this.#finishRequest(request, responseError)
+    }
   }
 
   requestErrored(request, error) {
     console.error(error)
-    this.#resolveRequest(request)
+    this.#finishRequest(request)
   }
 
   requestFinished(request) {
@@ -298,6 +318,7 @@ export class FrameController {
     const frame = context?.frame || this.#findFrameElement(formSubmission.formElement, formSubmission.submitter)
     const proposedVisit = context?.proposedVisit
 
+    frame.delegate.#pendingMorphRefresh = false
     frame.delegate.loadResponse(response, formSubmission.fetchRequest.url, { proposedVisit })
 
     if (!formSubmission.isSafe) {
@@ -310,6 +331,7 @@ export class FrameController {
   }
 
   formSubmissionFailedWithResponse(formSubmission, fetchResponse) {
+    this.#pendingMorphRefresh = false
     this.element.delegate.loadResponse(fetchResponse, formSubmission.fetchRequest.url)
     session.clearCache()
   }
@@ -354,9 +376,51 @@ export class FrameController {
 
   // Private
 
-  #resolveRequest(request) {
-    this.#fetchRequests.get(request)?.resolve()
+  #reload({ isMorphRefresh = false } = {}) {
+    const { refresh, src } = this.element
+    const hadActiveRequest = this.#currentFetchRequest !== null
+
+    this.#pendingMorphRefresh = false
+    this.element.removeAttribute("complete")
+    this.sourceURL = null
+    this.#cancelFetchRequest()
+    this.sourceURL = src
+
+    if (this.loadingStyle == FrameLoadingStyle.eager || this.#hasBeenLoaded || (isMorphRefresh && hadActiveRequest)) {
+      this.#loadSourceURL({ shouldMorphFrame: refresh === "morph", isMorphRefresh })
+    }
+
+    return this.element.loaded
+  }
+
+  #cancelFetchRequest() {
+    const request = this.#currentFetchRequest
+    request?.cancel()
+
+    if (this.#currentFetchRequest === request) {
+      this.#currentFetchRequest = null
+    }
+  }
+
+  #finishRequest(request, responseError) {
+    const context = this.#fetchRequests.get(request)
+    const isCurrentRequest = this.#currentFetchRequest === request
+    const aborted = responseError?.name === "AbortError"
+    const shouldRefresh = !aborted && isCurrentRequest && context?.isMorphRefresh && this.#pendingMorphRefresh
+
+    if (isCurrentRequest) {
+      this.#currentFetchRequest = null
+      this.#pendingMorphRefresh = false
+    }
+
     this.#fetchRequests.delete(request)
+
+    if (context && !aborted) {
+      this.#hasBeenLoaded = true
+      context.resolve()
+    }
+
+    if (shouldRefresh) this.refreshForMorph()
   }
 
   #prepareFormSubmissionVisit(formSubmission, context) {
@@ -434,25 +498,18 @@ export class FrameController {
     }
   }
 
-  async #visit(url, shouldMorphFrame = false) {
+  async #visit(url, { shouldMorphFrame = false, isMorphRefresh = false } = {}) {
     const request = new FetchRequest(this, FetchMethod.get, url, new URLSearchParams(), this.element)
 
-    this.#currentFetchRequest?.cancel()
+    this.#cancelFetchRequest()
     this.#currentFetchRequest = request
 
     return new Promise((resolve) => {
-      const resolveRequest = () => {
-        if (this.#currentFetchRequest === request) {
-          this.#resolveVisitPromise = () => {}
-          this.#currentFetchRequest = null
-        }
-        resolve()
-      }
-      this.#resolveVisitPromise = resolveRequest
       this.#fetchRequests.set(request, {
         proposedVisit: this.#proposedVisit,
         shouldMorphFrame,
-        resolve: resolveRequest
+        isMorphRefresh,
+        resolve
       })
       this.#proposedVisit = null
       request.perform()
@@ -729,7 +786,7 @@ export class FrameController {
   }
 
   get isLoading() {
-    return this.formSubmission !== undefined || this.#resolveVisitPromise() !== undefined
+    return this.formSubmission !== undefined || this.#currentFetchRequest !== null
   }
 
   get complete() {
