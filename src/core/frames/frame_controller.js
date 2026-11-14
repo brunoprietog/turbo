@@ -36,7 +36,6 @@ export class FrameController {
   #connected = false
   #hasBeenLoaded = false
   #ignoredAttributes = new Set()
-  #shouldMorphFrame = false
   #formSubmissions = new Set()
   #formSubmissionContexts = new WeakMap()
 
@@ -113,11 +112,15 @@ export class FrameController {
   sourceURLReloaded() {
     const { refresh, src } = this.element
 
-    this.#shouldMorphFrame = src && refresh === "morph"
-
     this.element.removeAttribute("complete")
-    this.element.src = null
-    this.element.src = src
+    this.sourceURL = null
+    this.#currentFetchRequest?.cancel()
+    this.sourceURL = src
+
+    if (this.loadingStyle == FrameLoadingStyle.eager || this.#hasBeenLoaded) {
+      this.#loadSourceURL(refresh === "morph")
+    }
+
     return this.element.loaded
   }
 
@@ -130,16 +133,16 @@ export class FrameController {
     }
   }
 
-  async #loadSourceURL() {
+  async #loadSourceURL(shouldMorphFrame = false) {
     if (this.enabled && this.isActive && !this.complete && this.sourceURL) {
-      this.element.loaded = this.#visit(expandURL(this.sourceURL))
+      this.element.loaded = this.#visit(expandURL(this.sourceURL), shouldMorphFrame)
       this.appearanceObserver.stop()
       await this.element.loaded
       this.#hasBeenLoaded = true
     }
   }
 
-  async loadResponse(fetchResponse, requestURL, proposedVisit = null) {
+  async loadResponse(fetchResponse, requestURL, { proposedVisit = null, shouldMorphFrame = false } = {}) {
     if (fetchResponse.redirected || (fetchResponse.succeeded && fetchResponse.isHTML)) {
       const responseURL = expandURL(fetchResponse.response.url)
       if (!fetchResponse.redirected && !responseURL.hash && requestURL) {
@@ -163,13 +166,12 @@ export class FrameController {
         const pageSnapshot = PageSnapshot.fromDocument(document)
 
         if (pageSnapshot.isVisitable) {
-          await this.#loadFrameResponse(fetchResponse, document, proposedVisit)
+          await this.#loadFrameResponse(fetchResponse, document, proposedVisit, shouldMorphFrame)
         } else {
           await this.#handleUnvisitableFrameResponse(fetchResponse)
         }
       }
     } finally {
-      this.#shouldMorphFrame = false
       if (this.#proposedVisit === proposedVisit) this.#proposedVisit = null
     }
   }
@@ -261,12 +263,12 @@ export class FrameController {
   }
 
   async requestSucceededWithResponse(request, response) {
-    await this.loadResponse(response, request.url, this.#fetchRequests.get(request)?.proposedVisit)
+    await this.loadResponse(response, request.url, this.#fetchRequests.get(request))
     this.#resolveRequest(request)
   }
 
   async requestFailedWithResponse(request, response) {
-    await this.loadResponse(response, request.url, this.#fetchRequests.get(request)?.proposedVisit)
+    await this.loadResponse(response, request.url, this.#fetchRequests.get(request))
     this.#resolveRequest(request)
   }
 
@@ -296,7 +298,7 @@ export class FrameController {
     const frame = context?.frame || this.#findFrameElement(formSubmission.formElement, formSubmission.submitter)
     const proposedVisit = context?.proposedVisit
 
-    frame.delegate.loadResponse(response, formSubmission.fetchRequest.url, proposedVisit)
+    frame.delegate.loadResponse(response, formSubmission.fetchRequest.url, { proposedVisit })
 
     if (!formSubmission.isSafe) {
       session.clearCache()
@@ -403,9 +405,9 @@ export class FrameController {
     }
   }
 
-  async #loadFrameResponse(fetchResponse, document, proposedVisit) {
+  async #loadFrameResponse(fetchResponse, document, proposedVisit, shouldMorphFrame) {
     const newFrameElement = await this.extractForeignFrameElement(document.body)
-    const rendererClass = this.#shouldMorphFrame ? MorphingFrameRenderer : FrameRenderer
+    const rendererClass = shouldMorphFrame ? MorphingFrameRenderer : FrameRenderer
 
     if (newFrameElement) {
       const snapshot = new Snapshot(newFrameElement)
@@ -432,7 +434,7 @@ export class FrameController {
     }
   }
 
-  async #visit(url) {
+  async #visit(url, shouldMorphFrame = false) {
     const request = new FetchRequest(this, FetchMethod.get, url, new URLSearchParams(), this.element)
 
     this.#currentFetchRequest?.cancel()
@@ -447,7 +449,11 @@ export class FrameController {
         resolve()
       }
       this.#resolveVisitPromise = resolveRequest
-      this.#fetchRequests.set(request, { proposedVisit: this.#proposedVisit, resolve: resolveRequest })
+      this.#fetchRequests.set(request, {
+        proposedVisit: this.#proposedVisit,
+        shouldMorphFrame,
+        resolve: resolveRequest
+      })
       this.#proposedVisit = null
       request.perform()
     })
