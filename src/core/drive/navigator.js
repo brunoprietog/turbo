@@ -1,8 +1,9 @@
 import { getVisitAction } from "../../util"
 import { FormSubmission } from "./form_submission"
-import { expandURL, getAnchor, getRequestURL } from "../url"
+import { expandURL } from "../url"
 import { Visit } from "./visit"
 import { PageSnapshot } from "./page_snapshot"
+import { ViewTransitioner } from "./view_transitioner"
 
 export class Navigator {
   constructor(delegate) {
@@ -71,7 +72,10 @@ export class Navigator {
   async formSubmissionSucceededWithResponse(formSubmission, fetchResponse) {
     if (formSubmission == this.formSubmission) {
       const responseHTML = await fetchResponse.responseHTML
-      if (responseHTML) {
+      if (
+        responseHTML && formSubmission == this.formSubmission &&
+        !formSubmission.fetchRequest.abortSignal.aborted
+      ) {
         const shouldCacheSnapshot = formSubmission.isSafe
         if (!shouldCacheSnapshot) {
           this.view.clearSnapshotCache()
@@ -89,19 +93,31 @@ export class Navigator {
     }
   }
 
+  formSubmissionSucceededWithStreamResponse(_formSubmission, _fetchResponse) {
+    this.view.clearSnapshotCache()
+  }
+
   async formSubmissionFailedWithResponse(formSubmission, fetchResponse) {
     const responseHTML = await fetchResponse.responseHTML
 
-    if (responseHTML) {
+    if (
+      responseHTML && formSubmission == this.formSubmission &&
+      !formSubmission.fetchRequest.abortSignal.aborted
+    ) {
       const snapshot = PageSnapshot.fromHTMLString(responseHTML)
-      if (fetchResponse.serverError) {
-        await this.view.renderError(snapshot, this.currentVisit)
-      } else {
-        await this.view.renderPage(snapshot, false, true, this.currentVisit)
-      }
-      if(!snapshot.shouldPreserveScrollPosition) {
-        this.view.scrollToTop()
-      }
+      await new ViewTransitioner().renderChange(
+        this.view.shouldTransitionTo(snapshot),
+        async () => {
+          if (fetchResponse.serverError) {
+            await this.view.renderError(snapshot, this.currentVisit)
+          } else {
+            await this.view.renderPage(snapshot, false, true, this.currentVisit)
+          }
+          if (snapshot.refreshScroll !== "preserve") {
+            this.view.scrollToTop()
+          }
+        }
+      )
       this.view.clearSnapshotCache()
     }
   }
@@ -139,20 +155,10 @@ export class Navigator {
     delete this.currentVisit
   }
 
+  // Same-page links are no longer handled with a Visit.
+  // This method is still needed for Turbo Native adapters.
   locationWithActionIsSamePage(location, action) {
-    const anchor = getAnchor(location)
-    const currentAnchor = getAnchor(this.view.lastRenderedLocation)
-    const isRestorationToTop = action === "restore" && typeof anchor === "undefined"
-
-    return (
-      action !== "replace" &&
-      getRequestURL(location) === getRequestURL(this.view.lastRenderedLocation) &&
-      (isRestorationToTop || (anchor != null && anchor !== currentAnchor))
-    )
-  }
-
-  visitScrolledToSamePageLocation(oldURL, newURL) {
-    this.delegate.visitScrolledToSamePageLocation(oldURL, newURL)
+    return false
   }
 
   // Visits

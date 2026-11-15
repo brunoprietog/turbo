@@ -1,7 +1,7 @@
 import { StreamElement } from "../../elements"
 import { nextAnimationFrame } from "../../util"
 import { DOMTestCase } from "../helpers/dom_test_case"
-import { assert } from "@open-wc/testing"
+import { assert, waitUntil } from "@open-wc/testing"
 import { sleep } from "../helpers/page"
 import * as Turbo from "../../index"
 
@@ -208,6 +208,17 @@ test("action=after", async () => {
   assert.isNull(element.parentElement)
 })
 
+
+test("action=after with children ID already present in target", async () => {
+  subject.fixtureHTML = `<div id="hello"><div id="top">Top</div><div id="middle">Middle</div><div id="bottom">Bottom</div></div>`
+  const element = createStreamElement("after", "top", createTemplateElement(' <div id="middle">New Middle</div> tail1 '))
+
+  subject.append(element)
+  await nextAnimationFrame()
+
+  assert.equal(subject.find("#hello")?.textContent, "Top New Middle tail1 Bottom")
+})
+
 test("action=before", async () => {
   const element = createStreamElement("before", "hello", createTemplateElement(`<h1 id="before">Before Turbo</h1>`))
   assert.equal(subject.find("#hello")?.textContent, "Hello Turbo")
@@ -221,14 +232,34 @@ test("action=before", async () => {
   assert.isNull(element.parentElement)
 })
 
+
+test("action=before with children ID already present in target", async () => {
+  subject.fixtureHTML = `<div id="hello"><div id="top">Top</div><div id="middle">Middle</div><div id="bottom">Bottom</div></div>`
+  const element = createStreamElement("before", "bottom", createTemplateElement(' <div id="middle">New Middle</div> tail1 '))
+
+  subject.append(element)
+  await nextAnimationFrame()
+
+  assert.equal(subject.find("#hello")?.textContent, "Top New Middle tail1 Bottom")
+})
+
 test("test action=refresh", async () => {
   document.body.setAttribute("data-modified", "")
   assert.ok(document.body.hasAttribute("data-modified"))
 
   const element = createStreamElement("refresh")
-  subject.append(element)
+  let refreshCompleted = false
+  const onLoad = () => {
+    refreshCompleted = true
+  }
+  document.addEventListener("turbo:load", onLoad, { once: true })
 
-  await sleep(250)
+  try {
+    subject.append(element)
+    await waitUntil(() => refreshCompleted, "refresh did not finish", { timeout: 1500 })
+  } finally {
+    document.removeEventListener("turbo:load", onLoad)
+  }
 
   assert.notOk(document.body.hasAttribute("data-modified"))
 })

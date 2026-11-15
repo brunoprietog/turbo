@@ -105,11 +105,14 @@ export class Session {
     }
   }
 
-  refresh(url, requestId) {
+  refresh(url, options = {}) {
+    options = typeof options === "string" ? { requestId: options } : options
+
+    const { method, requestId, scroll } = options
     const isRecentRequest = requestId && this.recentRequests.has(requestId)
     const isCurrentUrl = url === document.baseURI
     if (!isRecentRequest && !this.navigator.currentVisit && isCurrentUrl) {
-      this.visit(url, { action: "replace", shouldCacheSnapshot: false })
+      this.visit(url, { action: "replace", shouldCacheSnapshot: false, refresh: { method, scroll } })
     }
   }
 
@@ -213,6 +216,12 @@ export class Session {
     }
   }
 
+  historyPoppedWithEmptyState(location) {
+    this.history.replace(location)
+    this.view.lastRenderedLocation = location
+    this.view.cacheSnapshot()
+  }
+
   // Scroll observer delegate
 
   scrollPositionChanged(position) {
@@ -257,7 +266,7 @@ export class Session {
   // Navigator delegate
 
   allowsVisitingLocationWithAction(location, action) {
-    return this.locationWithActionIsSamePage(location, action) || this.applicationAllowsVisitingLocation(location)
+    return this.applicationAllowsVisitingLocation(location)
   }
 
   visitProposedToLocation(location, options) {
@@ -273,23 +282,13 @@ export class Session {
       this.view.markVisitDirection(visit.direction)
     }
     extendURLWithDeprecatedProperties(visit.location)
-    if (!visit.silent) {
-      this.notifyApplicationAfterVisitingLocation(visit.location, visit.action)
-    }
+    this.notifyApplicationAfterVisitingLocation(visit.location, visit.action)
   }
 
   visitCompleted(visit) {
     this.view.unmarkVisitDirection()
     clearBusyState(document.documentElement)
     this.notifyApplicationAfterPageLoad(visit.getTimingMetrics())
-  }
-
-  locationWithActionIsSamePage(location, action) {
-    return this.navigator.locationWithActionIsSamePage(location, action)
-  }
-
-  visitScrolledToSamePageLocation(oldURL, newURL) {
-    this.notifyApplicationAfterVisitingSamePageLocation(oldURL, newURL)
   }
 
   // Form submit observer delegate
@@ -331,9 +330,7 @@ export class Session {
   // Page view delegate
 
   viewWillCacheSnapshot() {
-    if (!this.navigator.currentVisit?.silent) {
-      this.notifyApplicationBeforeCachingSnapshot()
-    }
+    this.notifyApplicationBeforeCachingSnapshot()
   }
 
   allowsImmediateRender({ element }, options) {
@@ -425,15 +422,6 @@ export class Session {
     })
   }
 
-  notifyApplicationAfterVisitingSamePageLocation(oldURL, newURL) {
-    dispatchEvent(
-      new HashChangeEvent("hashchange", {
-        oldURL: oldURL.toString(),
-        newURL: newURL.toString()
-      })
-    )
-  }
-
   notifyApplicationAfterFrameLoad(frame) {
     return dispatch("turbo:frame-load", { target: frame })
   }
@@ -452,7 +440,7 @@ export class Session {
     if (config.forms.mode == "off") {
       return false
     } else {
-      const submitterIsNavigatable = submitter ? this.elementIsNavigatable(submitter) : true
+      const submitterIsNavigatable = this.submitterIsNavigatable(submitter)
 
       if (config.forms.mode == "optin") {
         return submitterIsNavigatable && form.closest('[data-turbo="true"]') != null
@@ -460,6 +448,16 @@ export class Session {
         return submitterIsNavigatable && this.elementIsNavigatable(form)
       }
     }
+  }
+
+  submitterIsNavigatable(submitter) {
+    if (!submitter) return true
+
+    if (submitter.hasAttribute("form") && submitter.form instanceof HTMLFormElement) {
+      return submitter.getAttribute("data-turbo") != "false"
+    }
+
+    return this.elementIsNavigatable(submitter)
   }
 
   elementIsNavigatable(element) {

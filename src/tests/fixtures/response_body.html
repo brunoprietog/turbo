@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="turbo-prefetch" content="false">
+    <title>Response body timing</title>
+    <script>
+      window.responseBodyEvents = { headers: 0, ended: [], errors: [], beforeCache: [], beforeRender: [], beforeFrameRender: [], beforeStreamRender: [] }
+      window.responseBodyState = () => {
+        const form = document.getElementById("page-form")
+        const button = document.getElementById("page-submit")
+        const frame = document.getElementById("frame")
+        const frameForm = document.getElementById("frame-form")
+        const frameButton = document.getElementById("frame-submit")
+        return {
+          pageBusy: document.documentElement.hasAttribute("aria-busy"),
+          formBusy: form?.hasAttribute("aria-busy") || false,
+          buttonDisabled: button?.disabled || false,
+          buttonText: button?.textContent,
+          frameBusy: frame?.hasAttribute("busy") || false,
+          frameFormBusy: frameForm?.hasAttribute("aria-busy") || false,
+          frameButtonDisabled: frameButton?.disabled || false,
+          frameButtonText: frameButton?.textContent
+        }
+      }
+      document.addEventListener("turbo:before-fetch-response", event => {
+        if (event.detail.fetchResponse.response.url.includes("/__turbo/response_body/")) window.responseBodyEvents.headers++
+      })
+      document.addEventListener("turbo:submit-end", event => {
+        window.responseBodyEvents.ended.push({ success: event.detail.success, state: window.responseBodyState() })
+      })
+      document.addEventListener("turbo:fetch-request-error", event => {
+        window.responseBodyEvents.errors.push({ name: event.detail.error.name, message: event.detail.error.message })
+      })
+      for (const [name, key] of [["turbo:before-cache", "beforeCache"], ["turbo:before-render", "beforeRender"], ["turbo:before-frame-render", "beforeFrameRender"], ["turbo:before-stream-render", "beforeStreamRender"]]) {
+        document.addEventListener(name, () => window.responseBodyEvents[key].push(window.responseBodyState()))
+      }
+    </script>
+    <script src="/dist/turbo.es2017-umd.js" data-turbo-track="reload"></script>
+  </head>
+  <body>
+    <!-- RESPONSE_BODY -->
+    <h1>$PAGE_TITLE</h1>
+    <form id="page-form" action="$RESPONSE_PATH" method="post">
+      <button id="page-submit" data-turbo-submits-with="Sending">Submit page</button>
+    </form>
+    <a id="next-page" href="$VISIT_PATH">Load another response</a>
+    <a id="one" href="/src/tests/fixtures/one.html">One</a>
+    <div id="message">Waiting for stream</div>
+    <turbo-frame id="frame">
+      <h2>$FRAME_TITLE</h2>
+      <form id="frame-form" action="$RESPONSE_PATH" method="post">
+        <button id="frame-submit" data-turbo-submits-with="Sending">Submit frame</button>
+      </form>
+    </turbo-frame>
+  </body>
+</html>

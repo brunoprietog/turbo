@@ -46,6 +46,8 @@ export const FetchEnctype = {
 export class FetchRequest {
   abortController = new AbortController()
   #resolveRequestPromise = (_value) => {}
+  #adoptedRequest = null
+  #requestFinishedPromise = null
 
   constructor(delegate, method, location, requestBody = new URLSearchParams(), target = null, enctype = FetchEnctype.urlEncoded) {
     const [url, body] = buildResourceAndBody(expandURL(location), method, requestBody, enctype)
@@ -116,54 +118,79 @@ export class FetchRequest {
 
   cancel() {
     this.abortController.abort()
+    this.#adoptedRequest?.cancel()
   }
 
   async perform() {
     const { fetchOptions } = this
     this.delegate.prepareRequest(this)
     const event = await this.#allowRequestToBeIntercepted(fetchOptions)
+    let resolveRequestFinished, requestError
+    const requestFinishedPromise = new Promise((resolve) => resolveRequestFinished = resolve)
+    this.#requestFinishedPromise = requestFinishedPromise
+
     try {
       this.delegate.requestStarted(this)
 
       if (event.detail.fetchRequest) {
-        this.response = event.detail.fetchRequest.response
+        this.#adoptedRequest = event.detail.fetchRequest
+        if (this.abortSignal.aborted) this.#adoptedRequest.cancel()
+        this.response = this.#adoptedRequest.response
       } else {
         this.response = fetch(this.url.href, fetchOptions)
       }
 
       const response = await this.response
+      if (this.#adoptedRequest && this.#isAborted) return
       return await this.receive(response)
     } catch (error) {
-      if (error.name !== "AbortError") {
+      requestError = error
+      if (error.name !== "AbortError" || !this.#isAborted) {
         if (this.#willDelegateErrorHandling(error)) {
           this.delegate.requestErrored(this, error)
         }
-        throw error
       }
     } finally {
-      this.delegate.requestFinished(this)
+      try {
+        this.delegate.requestFinished(this)
+      } finally {
+        if (this.#requestFinishedPromise === requestFinishedPromise) this.#requestFinishedPromise = null
+        const shouldHandleResponse = !this.#isAborted || (!this.#adoptedRequest && !requestError)
+        resolveRequestFinished(shouldHandleResponse)
+      }
     }
   }
 
   async receive(response) {
-    const fetchResponse = new FetchResponse(response)
+    const fetchResponse = new RequestFetchResponse(response, this.#requestFinishedPromise)
     const event = dispatch("turbo:before-fetch-response", {
       cancelable: true,
       detail: { fetchResponse },
       target: this.target
     })
-    if (event.defaultPrevented) {
-      this.delegate.requestPreventedHandlingResponse(this, fetchResponse)
-    } else {
-      await fetchResponse.responseHTML
 
-      if (fetchResponse.succeeded) {
-        this.delegate.requestSucceededWithResponse(this, fetchResponse)
-      } else {
-        this.delegate.requestFailedWithResponse(this, fetchResponse)
+    try {
+      await RequestFetchResponse.readBody(fetchResponse, event.defaultPrevented)
+    } catch (error) {
+      if (this.#isAborted && error.name === "TypeError") {
+        throw new DOMException("The request was aborted.", "AbortError")
       }
+      throw error
     }
 
+    if (this.#adoptedRequest && this.#isAborted) return fetchResponse
+
+    let responseHandling
+    if (event.defaultPrevented) {
+      responseHandling = this.delegate.requestPreventedHandlingResponse(this, fetchResponse)
+    } else if (fetchResponse.succeeded) {
+      responseHandling = this.delegate.requestSucceededWithResponse(this, fetchResponse)
+    } else {
+      responseHandling = this.delegate.requestFailedWithResponse(this, fetchResponse)
+    }
+    Promise.resolve(responseHandling).catch((error) => {
+      if (error?.name !== "AbortError") throw error
+    })
     return fetchResponse
   }
 
@@ -183,6 +210,10 @@ export class FetchRequest {
 
   acceptResponseType(mimeType) {
     this.headers["Accept"] = [mimeType, this.headers["Accept"]].join(", ")
+  }
+
+  get #isAborted() {
+    return this.abortSignal.aborted || this.fetchOptions.signal?.aborted || this.#adoptedRequest?.abortSignal?.aborted
   }
 
   async #allowRequestToBeIntercepted(fetchOptions) {
@@ -217,9 +248,35 @@ export function isSafe(fetchMethod) {
   return fetchMethodFromString(fetchMethod) == FetchMethod.get
 }
 
+class RequestFetchResponse extends FetchResponse {
+  #requestFinishedPromise
+  #htmlRequested = false
+
+  static async readBody(fetchResponse, responseHandlingPrevented) {
+    if (fetchResponse.isHTML && (!responseHandlingPrevented || fetchResponse.#htmlRequested)) {
+      await fetchResponse.responseText
+    }
+  }
+
+  constructor(response, requestFinishedPromise) {
+    super(response)
+    this.#requestFinishedPromise = requestFinishedPromise
+  }
+
+  get responseHTML() {
+    this.#htmlRequested = true
+    return Promise.resolve(this.#requestFinishedPromise).then((shouldHandleResponse) => {
+      if (shouldHandleResponse === false) throw new DOMException("The request was aborted.", "AbortError")
+      return super.responseHTML
+    })
+  }
+}
+
 function buildResourceAndBody(resource, method, requestBody, enctype) {
   const searchParams =
-    Array.from(requestBody).length > 0 ? new URLSearchParams(entriesExcludingFiles(requestBody)) : resource.searchParams
+    Array.from(requestBody).length > 0
+      ? new URLSearchParams(entriesExcludingFiles(requestBody))
+      : new URLSearchParams(resource.searchParams)
 
   if (isSafe(method)) {
     return [mergeIntoURLSearchParams(resource, searchParams), null]

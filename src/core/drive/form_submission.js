@@ -119,8 +119,10 @@ export class FormSubmission {
     }
   }
 
-  requestStarted(_request) {
+  requestStarted(request) {
+    this.delegate.formSubmissionWillStart?.(this)
     this.state = FormSubmissionState.waiting
+    if (!request.isSafe) prefetchCache.pause(request)
     if (this.submitter) config.forms.submitter.beforeSubmit(this.submitter)
     this.setSubmitsWith()
     markAsBusy(this.formElement)
@@ -132,12 +134,20 @@ export class FormSubmission {
   }
 
   requestPreventedHandlingResponse(request, response) {
+    if (request.abortSignal.aborted) return
+
     prefetchCache.clear()
 
     this.result = { success: response.succeeded, fetchResponse: response }
+
+    if (response.succeeded && !this.isSafe && response.contentType?.startsWith(StreamMessage.contentType)) {
+      this.delegate.formSubmissionSucceededWithStreamResponse?.(this, response)
+    }
   }
 
   requestSucceededWithResponse(request, response) {
+    if (request.abortSignal.aborted) return
+
     if (response.clientError || response.serverError) {
       this.delegate.formSubmissionFailedWithResponse(this, response)
       return
@@ -156,6 +166,8 @@ export class FormSubmission {
   }
 
   requestFailedWithResponse(request, response) {
+    if (request.abortSignal.aborted) return
+
     this.result = { success: false, fetchResponse: response }
     this.delegate.formSubmissionFailedWithResponse(this, response)
   }
@@ -165,8 +177,9 @@ export class FormSubmission {
     this.delegate.formSubmissionErrored(this, error)
   }
 
-  requestFinished(_request) {
+  requestFinished(request) {
     this.state = FormSubmissionState.stopped
+    prefetchCache.resume(request)
     if (this.submitter) config.forms.submitter.afterSubmit(this.submitter)
     this.resetSubmitterText()
     clearBusyState(this.formElement)
