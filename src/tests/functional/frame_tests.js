@@ -1187,6 +1187,51 @@ test("navigating frame with button[data-turbo-action=advance] pushes URL state",
   await expect(page.locator("#frame"), "marks the frame as [complete]").toHaveAttribute("complete")
 })
 
+for (const method of ["get", "post"]) {
+  test(`restoring history after a promoted ${method.toUpperCase()} form submission restores an idle form`, async ({ page }) => {
+    const location = page.url()
+    await page.locator("#frame form").first().evaluate((form, method) => {
+      form.method = method
+      form.setAttribute("data-turbo-action", "advance")
+      if (method === "post") {
+        form.action = "/__turbo/redirect?path=/src/tests/fixtures/frames/frame.html"
+      }
+      window.promotedSubmissionFinished = new Promise(resolve => {
+        const submitted = event => {
+          if (event.detail.formSubmission.formElement === form) {
+            document.removeEventListener("turbo:submit-end", submitted)
+            resolve()
+          }
+        }
+        document.addEventListener("turbo:submit-end", submitted)
+      })
+      window.promotedVisitLoaded = new Promise(resolve => {
+        const loaded = () => {
+          if (window.location.pathname === "/src/tests/fixtures/frames/frame.html") {
+            document.removeEventListener("turbo:load", loaded)
+            resolve()
+          }
+        }
+        document.addEventListener("turbo:load", loaded)
+      })
+      const button = form.querySelector("button")
+      button.setAttribute("data-turbo-submits-with", "Sending")
+      document.body.insertAdjacentHTML("beforeend", '<div id="marker">Client-only marker</div>')
+    }, method)
+    await page.click("#frame-form-get-no-redirect")
+    await page.evaluate(() => Promise.all([window.promotedSubmissionFinished, window.promotedVisitLoaded]))
+    await expect(page.locator("#frame h2")).toHaveText("Frame: Loaded")
+    await expect(page).toHaveURL(/\/src\/tests\/fixtures\/frames\/frame\.html/)
+    await page.goBack()
+    await expect(page).toHaveURL(location)
+    await expect(page.locator("#frame-form-get-no-redirect")).toBeVisible()
+    await expect(page.locator("#marker")).toHaveCount(1)
+    await expect(page.locator("#frame-form-get-no-redirect")).toBeEnabled()
+    await expect(page.locator("#frame-form-get-no-redirect")).toHaveText("Navigate #frame without a redirect")
+    await expect(page.locator("#frame form").first()).not.toHaveAttribute("aria-busy")
+  })
+}
+
 test("navigating back after pushing URL state from a turbo-frame[data-turbo-action=advance] restores the frames previous contents", async ({
   page
 }) => {
